@@ -78,6 +78,18 @@ interpolant in Eq. (1); bit-exact parity with the authors' original hook
 is not claimed — the released per-step γ vectors and run manifests are
 the reference for the reported numbers.
 
+## End-to-end demo (revision, card R3)
+
+`scripts/run_probe.py` plus the guard/evaluation loop were also run as a
+small end-to-end pipeline test on CogVideoX-5B-I2V: 6 DAVIS first-frame
+sources (3 calibration + 3 held-out), one prompt, seed 42, T=30,
+p=24, 49 frames, m=4 probe pairs per calibration source. The run
+script is the same code path used in the paper's revision E2E
+(`run_probe` -> classifier -> candidate -> guard -> held-out eval);
+the per-run JSON records regime, guard bound, held-out deltas, and
+generation timings. Reduced scale is deliberate and disclosed; it
+validates the software path, not a new effectiveness panel.
+
 ## Repo layout
 
 ```
