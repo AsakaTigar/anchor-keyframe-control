@@ -5,6 +5,8 @@ Released with the IEEE Transactions on Consumer Electronics revision of
 > **ANCHOR: Probe, Classify, Gate — Interface- and Domain-Adaptive
 > Keyframe Control for Video Diffusion**
 
+Repository: <https://github.com/AsakaTigar/anchor-keyframe-control>
+
 This repository contains the controller and its statistics, written to
 be re-implementable from the paper alone:
 
