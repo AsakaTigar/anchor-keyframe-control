@@ -1,0 +1,6 @@
+torch>=2.1
+diffusers>=0.31
+transformers>=4.40
+lpips>=0.1.4
+opencv-python-headless>=4.8
+Pillow>=10.0
