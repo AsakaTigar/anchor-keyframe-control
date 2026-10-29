@@ -1,0 +1,960 @@
+%% ANCHOR v2 — AAAI 2027 submission (top1pct rewrite)
+%% Compile: pdflatex AAAI1_main_v5 && bibtex AAAI1_main_v5 && pdflatex x2
+%% SSv2 numbers trace to results/ssv2_decisive_summary.json and its
+%% immutable raw-manifest hash; other reported diagnostics retain their
+%% lineage-specific provenance.
+\documentclass[letterpaper]{article}
+\usepackage[submission]{aaai2027}  % camera-ready: remove [submission]
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{natbib}
+\usepackage{booktabs,multirow}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\urlstyle{rm}
+\frenchspacing
+\setcounter{secnumdepth}{2}
+\setlength{\emergencystretch}{2em}
+\setlength{\pdfpagewidth}{8.5in}
+\setlength{\pdfpageheight}{11in}
+
+\newcommand{\method}{\textsc{Anchor}}
+\newcommand{\proj}{\Pi_{[0,1]}}
+\newcommand{\lsnr}{\mathrm{logSNR}}
+\DeclareMathOperator{\diag}{diag}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{assumption}{Assumption}
+\newtheorem{definition}{Definition}
+\newtheorem{lemma}{Lemma}
+
+\title{ANCHOR: Probe, Classify, Gate---\\
+Interface- and Domain-Adaptive Keyframe Control for Video Diffusion}
+\author{Anonymous Submission}
+\affiliations{Anonymous Affiliation}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Placing a user-specified image at an \emph{interior} time of a generated
+video is usually treated as a scheduling problem: decide when to inject
+the image's native condition. The schedule is the wrong unit of deployment: the same delayed
+re-assertion family reduces interior anchor error by $28\%$ on CogVideoX's
+concat interface, increases it by $93\%$ on VACE's mask interface, and is
+locally vacuous on an LTX token interface whose swap response is
+$0.040{\pm}0.009$. Worse, a fixed-response CogVideoX schedule tuned on DAVIS reverses on
+Something-Something-v2 (SSv2), losing to
+Native-Full in $54/54$ seeded runs (anchor LPIPS $0.872$ vs.\ $0.228$;
+source-level paired difference $0.645$, BCa 95\% CI $[0.587,0.690]$).
+ANCHOR turns this failure into a conservative controller: (1) a signed,
+symmetric fixed-seed probe estimates target reachability and early
+response--residual alignment; (2) confidence intervals classify the
+interface--domain pair as \textsc{Wall}, \textsc{Persistent},
+\textsc{Droppable}, or \textsc{Uncertain}; and (3) a native-full,
+micro-skip, or log-SNR candidate is deployed only after a paired
+target-domain calibration upper bound clears a non-inferiority margin.
+Otherwise ANCHOR abstains to the audited Native-Full endpoint. The selector,
+paired ridge estimator, manifest audit, and source-level inference are all
+implemented. A completed five-source CogVideoX/DAVIS signed probe returns
+\textsc{Uncertain} (mean $S=-27.2$, source-bootstrap BCa 95\% CI
+$[-292.1,243.9]$). Separately, a locked CogVideoX/DAVIS 10{+}10 lane
+passes promotion calibration and held-out val evaluation under the
+paper's non-inferiority guard with $\delta_{\rm NI}{=}0$ (val mean
+candidate-minus-native LPIPS $-0.154$, BCa 95\% CI
+$[-0.202,-0.108]$, $10/10$ sources favor the candidate;
+Table~\ref{tab:davis}).
+SSv2 still has no executed candidate arm or signed target-domain probe, so
+its audited replay in Table~\ref{tab:main} abstains and exactly reuses
+Native-Full outputs; this is schedule identity, not an SSv2 adaptive win.
+A benefit--disruption objective yields the sigmoid gate and the hard
+skip-$K$ limit, while the calibration guard supports distributional---not
+pointwise---non-inferiority. We measure the fixed-gate SSv2 failure and a
+guarded DAVIS-domain candidate certificate; SSv2 certificates and true
+online-feedback gains remain open. The revision's end-to-end test
+(Sec.~
+ef{sec:e2e}) exercises the full chain but ends in a correct
+abstention; a positive case where the certified candidate beats
+Native-Full on held-out sources is still missing.
+\end{abstract}
+
+\section{Introduction}
+Image-to-video diffusion inherited a convenient convention: the reference
+image sits at frame zero and generation rolls forward. Many practical
+requests violate it. A creator specifies a contact event, a pose apex, a
+product reveal, or a camera view at time $p$ in the middle of the clip and
+asks the model to construct what plausibly happened before and after. The
+condition becomes an \emph{interior keyframe}, and the task acquires a
+vector of goals: execute the anchor at frame $p$, do not copy it elsewhere,
+keep the seam around $p$ smooth, and keep the video moving.
+Fig.~\ref{fig:motivation} previews the two failure modes this paper is
+built around: the same schedule family flips sign across interfaces,
+and it flips sign across domains even when the interface is fixed.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.98\textwidth]{figures/fig_motivation.pdf}
+\caption{Fixed schedules do not transfer. (a)~On CogVideoX's concat
+interface, skipping early reverse steps helps (best $K{=}10$,
+$-28\%$ anchor error). (b)~On VACE's mask interface the \emph{same}
+skip family hurts after a shallow optimum (best $K{=}1$; $K{=}12$
+gives $+93\%$ anchor error). (c)~On LTX-Video's token interface the
+interior condition is nearly vacuous (swap response
+$0.040{\pm}0.009$). (d)~Even with the interface fixed (CogVideoX
+concat), a schedule that wins on DAVIS fails on SSv2: every fixed gate
+loses on all $54$ seeded runs ($0/54$; anchor LPIPS
+$0.872/0.926/0.931$ vs.\ $0.228$ for Native-Full). Frames in
+(a)--(c) are real generations from the executed interface diagnostics;
+numbers in (d) are Tables~\ref{tab:main}--\ref{tab:davis}. The failure
+is not the schedule family but the transfer assumption---which is what
+ANCHOR replaces with a probe, a classifier, and a target-domain
+certificate.}
+\label{fig:motivation}
+\end{figure*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/fig_anchor_architecture.pdf}
+\caption{Signed paired probe on a fixed native interface, with Concat (CogVideoX)~\citep{yang2024cogvideox}, Mask (VACE)~\citep{jiang2025vace}, and Token (LTX)~\citep{hacohen2025ltx} filmstrips.}
+\label{fig:architecture}
+\end{figure*}
+
+\paragraph{Boundary conditioning is not interior conditioning.}
+Nearly every deployed image-to-video system conditions on the
+\emph{first} frame: the reference image initializes the clip and the
+sampler rolls forward, so the condition is consumed once at $t{=}0$ and
+the remainder of the video is free-running. An \emph{interior keyframe}
+asks for a different contract: the image must be executed at an
+arbitrary time $p$ inside the clip, with plausible content generated
+\emph{before} and \emph{after} it. The two contracts differ in what the
+model is asked to do (initialize a trajectory vs.\ hit a target inside
+one), in how failure appears (slow drift vs.\ a missed anchor or a
+copied/leaked frame), and in what a schedule can act on: first-frame
+conditioning can only be re-asserted along the rollout and its
+influence at frame $p$ is \emph{propagated} through many steps, whereas
+an interior interface exposes a per-step condition channel whose
+response at $p$ may be strong, weak, or absent depending on the
+interface. This paper studies the interior contract. First-frame
+results appear only as a boundary baseline
+(Tab.~\ref{tab:interfaces}, ``boundary'' rows) precisely to show that
+propagated influence is a different estimand and must not be read as
+interior reachability.
+
+Recent training-free systems answer with \emph{scheduling}: decide at which
+reverse steps to inject, drop, or re-assert the native
+condition~\citep{lai2025flexti2v,jang2025frameguidance}. Underneath every
+such schedule sit two assumptions that, to our knowledge, no prior work
+tests: (i)~\emph{reachability}---the native interface can change the
+requested frame at all; and (ii)~\emph{portability}---a schedule family
+tuned on one interface--domain pair transfers elsewhere.
+
+\paragraph{Both assumptions fail, measurably.}
+We probe four open backbones with fixed-seed interventions: generate twice
+with identical noise, prompt, and schedule, change only the anchor image,
+and measure the response at the target frame relative to the anchor change
+(Sec.~\ref{sec:diag}; conditioning sites and protocols per backbone are
+disclosed in Tab.~\ref{tab:interfaces}). Three regimes emerge. On
+CogVideoX's concat interface~\citep{yang2024cogvideox} the interior
+channel executes anchors well, and skipping the first $K$ reverse steps
+\emph{reduces} interior anchor error by up to $28\%$. VACE's mask
+interface~\citep{jiang2025vace} responds to interior swaps almost
+unit-for-unit ($0.954{\pm}0.029$), yet the \emph{same} skip family reverses
+after a shallow optimum: $K{=}12$ increases anchor error by $93\%$ versus
+full conditioning. Its off-target anchor distance moves from $0.29$ to
+$0.94$, though we do not read that raw LPIPS distance as leakage. LTX-Video's token
+interface~\citep{hacohen2025ltx} barely responds to interior conditions at
+all ($0.040{\pm}0.009$): a local \emph{interface wall} where scheduling is
+vacuous. One family, three opposite behaviors---the schedule is not the
+object of interest; the \emph{interface response} is.
+
+\paragraph{From failure to an executable conservative rule.}
+We formalize the reverse process as a time-varying controlled system. A
+per-step level $\gamma_s\in[0,1]$ interpolates the native condition between
+its null path and the clean anchor. Linearization yields a target-response
+operator $G_s$ and off-target operator $L_s$. ANCHOR measures their action
+with symmetric paired probes, classifies only when confidence intervals
+separate a regime, proposes the regime-specific schedule, and requires an
+independent target-domain non-inferiority certificate before using any
+non-native schedule. A wall, ambiguous probe, missing certificate, or failed
+certificate maps to $\gamma\equiv1$. This extra domain guard is forced by
+the evidence: the SSv2 failure~\citep{goyal2017something} occurs on the same CogVideoX concat interface
+where the descriptive DAVIS~\citep{perazzi2016davis} fixed-schedule comparison has the opposite sign.
+
+\paragraph{Why this explains the schedule literature.}
+Fixed log-SNR gates---including hard skip-$K$---arise in the formulation as a
+restricted open-loop special case (Lem.~\ref{lem:openloop}). The special
+case holds only within its regime: within one interface, a threshold
+$\tau$ calibrated at $T{=}30$ predicts the panel-mean optimal skip depth at
+$T{=}50$ within $\pm2$ steps (predicted $K^\star{=}9$, observed $10$), and the same
+fixed gate has lower observed anchor LPIPS at noncentral positions $12$
+and $36$ on all $10$ clips at each position; across
+interfaces the measured structure inverts (VACE) or weakens sharply (LTX),
+and across domains it can reverse even with the interface fixed (DAVIS to
+SSv2). Thus both the response probe and target-domain guard are necessary.
+
+\paragraph{Contributions.}
+(1)~A localized controllability formulation for native video-diffusion
+conditioning, separating target reachability from temporal leakage, with a
+falsifiable interface-wall test and executed four-backbone diagnostics.
+(2)~An implemented probe--classify--gate selector with an explicit
+\textsc{Uncertain} state and a target-domain paired non-inferiority guard;
+every unsupported branch abstains to the bit-audited Native-Full endpoint.
+(3)~A benefit--disruption derivation of the log-SNR sigmoid and skip-$K$
+limit, plus an optional leakage-regularized QP and residual-feedback toolkit
+with synthetic descent and calibration-stability checks.
+(4)~A provenance-complete reanalysis of the $27$-source, two-seed SSv2
+stress test: all three fixed non-native schedules lose on all $54$ seeded
+runs, with source-level BCa intervals and corrected method/metric semantics;
+the guarded replay is disclosed as output reuse rather than a new experiment.
+
+\paragraph{Reproducibility artifact.}
+A reference implementation accompanies this revision as an MIT-licensed
+package: signed paired probe with the ridge/second-difference estimator,
+source-level BCa bootstrap, the four-way classifier, the target-domain
+non-inferiority guard, candidate schedules, and executable scripts that
+regenerate Tables~\ref{tab:main} and~\ref{tab:davis} from the released
+per-run CSV manifests. Third-party video-diffusion weights are not
+redistributed; backbone access is through documented wrapper scripts
+that state the conditioning site, resolution, step count, sampler, and
+guidance for each interface. Unit tests cover probe recovery on a known
+synthetic operator, all four classifier quadrants, the guard's
+deploy/abstain branches, and interval behaviour. The public repository
+is \url{https://github.com/AsakaTigar/anchor-keyframe-control}.
+
+\section{Related Work}
+\paragraph{Arbitrary-time image conditioning.}
+FlexTI2V inserts images at arbitrary positions via position-aware noise
+swapping~\citep{lai2025flexti2v}; Frame Guidance optimizes frame-level
+losses through the predicted clean video~\citep{jang2025frameguidance};
+Flowception interleaves observed frames through variable-length flow
+matching~\citep{ifriqi2025flowception}; VACE and LTX expose native
+keyframe interfaces~\citep{jiang2025vace,hacohen2025ltx}; SmartDirector
+and KeyFrame-Compass push multi-keyframe narratives and execution-centric
+evaluation~\citep{zhang2026smartdirector,tang2026keyframecompass}. These
+works establish the task; none measures whether the interface it uses
+reaches the requested frame, nor penalizes temporal leakage as a control cost.
+\paragraph{Condition scheduling in diffusion.}
+RePaint re-asserts known regions~\citep{lugmayr2022repaint}, SDEdit picks
+an entry noise level~\citep{meng2022sdedit}, posterior sampling injects
+measurement gradients~\citep{chung2023dps}, and classifier-free guidance
+scales condition strength~\citep{ho2022cfg}. All are open-loop in our
+taxonomy; our linearized formulation represents their timing decisions as
+restricted schedules on a measured response map.
+\paragraph{Evaluation.}
+LPIPS~\citep{zhang2018lpips} cannot see temporal mis-localization; we
+follow VBench/VBench++ and VideoScore in keeping quality axes
+disentangled~\citep{huang2024vbench,huang2024vbenchpp,he2024videoscore}
+and use anchor-specific execution diagnostics on the executed
+DAVIS~\citep{perazzi2016davis}, UCF-101~\citep{soomro2012ucf101}, and
+SSv2~\citep{goyal2017something} panels. EPIC-KITCHENS, RealEstate10K, and
+Vimeo-90K remain planned rather than reported
+evidence~\citep{damen2022epic,zhou2018realestate,xue2019vimeo}.
+
+\section{Interior-Keyframe Generation as Local Control}
+\label{sec:form}
+We now make the informal picture precise.
+Let $G_\theta$ be a frozen video diffusion model with a native image
+interface. Given anchor $a$, prompt $q$, requested frame $p$, seed $\xi$,
+and $T$ reverse steps, the output is
+$\hat x=G_\theta(a,q,p,\xi;\gamma)$ with schedule
+$\gamma=(\gamma_T,\ldots,\gamma_1)\in[0,1]^T$ acting on the native
+condition
+\begin{equation}
+c_s(\gamma_s)=c_\emptyset+\gamma_s\bigl(c(a)-c_\emptyset\bigr),
+\label{eq:native}
+\end{equation}
+where $c_\emptyset$ is the model's \emph{own} null path (unconditional,
+dropped-condition, or all-masked); a zero tensor is admitted only if a unit
+test shows equivalence. For each backbone we fix the interpolation site in
+condition-latent space and verify both endpoints: $\gamma{=}1$ must
+reproduce the official pipeline bit-compatibly and $\gamma{=}0$ its null
+path. On CogVideoX the $\gamma{=}1$ test passes exactly (LPIPS
+$0.000000$, max pixel difference $0$, $3$ clips $\times$ paired
+generations); backbones failing these tests are excluded rather than
+patched.
+
+\subsection{Target response and off-target leakage}
+Writing one reverse update as $z_{s-1}=F_s(z_s,c_s)$ with Jacobians
+$A_s=\partial F_s/\partial z_s$, $B_s=\partial F_s/\partial c_s$, a
+first-order expansion around a reference schedule $\bar\gamma$ gives
+\begin{equation}
+\delta z_0=\sum_{s=1}^{T}\Bigl(\prod_{r=1}^{s-1}A_r\Bigr)B_s\,\Delta c\,
+\delta\gamma_s+r(\delta\gamma),
+\label{eq:linear}
+\end{equation}
+with $\Delta c=c(a)-c_\emptyset$; the product follows implementation
+order (step $s$ propagated through steps $s{-}1,\ldots,1$).
+\begin{assumption}[Local smoothness]\label{ass:smooth}
+There is $\kappa_F<\infty$ with
+$\|r(\delta\gamma)\|\le(\kappa_F/2)\|\delta\gamma\|^2$ on the probe tube
+$\{\|\delta\gamma\|_\infty\le\varepsilon_0\}$.
+\end{assumption}
+Let $P_p$ select the requested frame, $P_{\neg p}$ the rest, and $\phi$ a
+fixed feature map. Define, for the given $(a,q,\xi)$,
+\begin{equation}
+\begin{aligned}
+G_s&=J_\phi P_p\Bigl(\prod_{r=1}^{s-1}A_r\Bigr)B_s\Delta c,\\
+L_s&=J_\phi P_{\neg p}\Bigl(\prod_{r=1}^{s-1}A_r\Bigr)B_s\Delta c.
+\end{aligned}
+\label{eq:GL}
+\end{equation}
+Fixed-noise finite differences estimate their action without
+differentiating through the sampler. We deliberately report the
+\emph{trajectory-level} estimand $G_s(a,q,\xi)$ and its variability across
+seeds, rather than an unidentified population average.
+
+\subsection{Diagnostics: two curves, not one scalar}
+For a normalized anchor swap $a\to a'$ define per-step target and leakage
+magnitudes $r_s,u_s$ and the summaries
+$R=\sum_s w_s r_s^2$ (reachability mass) and
+$U=\sum_s w_s u_s^2$ (leakage energy), $\sum_s w_s{=}1$. A localized
+controllability index
+$\mathrm{LCI}=R/(R+\lambda U+\epsilon)$ is reported \emph{only if}
+$R\ge 3\hat\sigma^2_{\mathrm{probe}}$, the null-swap noise floor;
+this validity gate prevents the classic $0/0$ pathology in which a weak
+interface scores as a localized one.
+
+\begin{proposition}[Local interface wall]\label{prop:wall}
+If $G_s=0$ for all $s$, then $J_\phi P_p\,\delta z_0=0$ to first order for
+every schedule perturbation: no local re-assertion schedule can change the
+tested target feature through this interface; any measured gain must be
+higher-order, use a different feature/intervention, or modify the model.
+\end{proposition}
+\begin{proof}
+Substitute $G_s\equiv 0$ into Eq.~\eqref{eq:linear} and keep first-order
+terms.
+\end{proof}
+The proposition is intentionally elementary; its empirical force comes
+from the estimator. We declare a wall only when the upper confidence bound
+for $R$ lies below $3\times$ the null-swap floor, and only after a
+hook-isolation audit excludes implementation error as the cause.
+
+\section{ANCHOR: Probe, Classify, Gate}
+\label{sec:method}
+\subsection{Stage 1: signed paired probe}
+ANCHOR calibrates an \emph{interface--domain pair}, not a backbone name in
+isolation. Fixed-seed anchor swaps estimate reachability against a null-swap
+noise floor. To estimate a signed response map, an interior reference
+schedule is perturbed symmetrically:
+\begin{equation}
+\begin{aligned}
+\hat x_j^\pm&=\hat x(\bar\gamma\pm\varepsilon v_j),\\
+Y_j&=\frac{\phi(\hat x_j^+)-\phi(\hat x_j^-)}{2\varepsilon},\\
+v_j&\in\{-1,1\}^T .
+\end{aligned}
+\label{eq:pairedprobe}
+\end{equation}
+The paired design removes the shared stochastic trajectory and avoids the
+one-sided clipping bias incurred when perturbing a box boundary. Ridge
+regression with a second-difference penalty estimates $G$ and $L$; probing
+continues until the stability bound below clears a frozen tolerance. A fixed
+``ten probe'' budget is not justified by our simulation: held-out recovery
+remains poor at $m{=}8$ and improves materially through $m{=}24$.
+
+\paragraph{Probe cost and certificate caching.}
+Calibrating one interface--domain pair costs $2m$ generator calls (two
+per Rademacher pair, no back-propagation; $2m{=}48$ at $m{=}24$) plus
+the fixed evaluation generations on calibration sources. This is a
+one-off cost per certificate, not a per-request cost: a certificate is
+keyed by model revision, condition site, sampler, domain, metric, and
+candidate vector, so a deployment service probes once per key and
+serves later requests from the stored certificate; any key change
+invalidates it and reverts requests to Native-Full until a new probe
+completes. Per-request overhead therefore equals the native pipeline
+plus a lookup, and the probe cost amortizes over the certificate's
+lifetime. Peak memory is dominated by the backbone; the probe adds one
+paired forward pass at a time and stores only schedule vectors and the
+recovered response maps ($O(T)$ and $O(dT)$).
+
+Let $K_0=\lceil T/6\rceil$, $g_{\rm early}=\sum_{s\le K_0}G_s$, and let
+$e_0$ be the target residual under the null continuation. The signed
+alignment statistic is
+\begin{equation}
+S=\langle g_{\rm early},e_0\rangle .
+\label{eq:alignment}
+\end{equation}
+Bootstrap intervals are computed over calibration sources. A stored norm
+$\|G_s\|$ cannot recover $S$ and is therefore invalid for classification.
+
+\subsection{Stage 2: confidence-aware classification}
+Write $R_{\rm lo},R_{\rm hi}$ and $S_{\rm lo},S_{\rm hi}$ for confidence
+bounds and $h=3\hat\sigma^2_{\rm probe}$. ANCHOR uses
+\begin{equation}
+\mathrm{regime}=\begin{cases}
+\textsc{Wall}, & R_{\rm hi}<h,\\
+\textsc{Persistent}, & R_{\rm lo}\ge h,\ S_{\rm lo}>0,\\
+\textsc{Droppable}, & R_{\rm lo}\ge h,\ S_{\rm hi}\le0,\\
+\textsc{Uncertain}, & \text{otherwise.}
+\end{cases}
+\label{eq:classify}
+\end{equation}
+An invalid, unsigned, one-sided, or non-identifiable probe is
+\textsc{Uncertain}. This fourth state is operationally essential: uncertainty
+must not be silently converted into a favorable regime.
+
+\paragraph{Why a conservative fallback is a product feature.}
+For a consumer authoring product, \textsc{Uncertain} is not an
+embarrassing null result; it is the state that makes the system
+shippable. First, it keeps \emph{quality monotone with evidence}: the
+tool emits the audited Native-Full video exactly when the interface--
+domain pair has not been certified, so a user never receives a
+regression that the system cannot justify. Second, it bounds
+\emph{cost and latency}: abstention deploys no probe-specific schedule
+and no candidate generation, so the worst-case request costs the same
+as the native pipeline plus the one-off certificate lookup. Third, it
+gives the interface a \emph{stable contract} across model revisions:
+a certificate is bound to a model revision, condition site, sampler,
+domain, and candidate vector (Sec.~\ref{sec:method}), and any change
+invalidates it back to \textsc{Uncertain} rather than silently
+consulting a stale schedule. Fourth, it is \emph{auditable}: every
+request carries a machine-readable verdict
+(\textsc{Wall}/\textsc{Persistent}/\textsc{Droppable}/
+\textsc{Uncertain}) and, when deployed, the bound that justified the
+candidate, which is what a consumer platform needs for incident review
+and for explaining an edit outcome to a creator. Finally, it converts
+an unverifiable gamble into a \emph{product decision}: teams can ship
+Native-Full today, collect certificates per interface--domain pair,
+and promote a candidate only when its own calibration bound clears the
+margin---an operating model that is compatible with staged rollout and
+A/B testing. The alternative---deploying an uncertified schedule and
+hoping it transfers---is exactly the failure mode measured on SSv2
+(Table~\ref{tab:main}), where three fixed schedules lose on all $54$
+seeded runs while the native endpoint does not move.
+
+\subsection{Stage 3: propose, certify, or abstain}
+The regime proposes one schedule:
+\begin{equation}
+\tilde\gamma_s=\begin{cases}
+1, & \textsc{Wall}\text{ or }\textsc{Uncertain},\\
+\mathbb 1[s>1], & \textsc{Persistent},\\
+\sigma\!\left(\alpha(\lsnr_s-\tau)\right), & \textsc{Droppable}.
+\end{cases}
+\label{eq:regimegate}
+\end{equation}
+The persistent candidate is the observed micro-skip $K{=}1$; the droppable
+candidate freezes $(\alpha,\tau)$ before target-domain evaluation. Neither
+non-native candidate is deployed directly. On independent target-domain
+calibration sources, we average seeds within each source and define
+$\Delta_i=\mathcal L_i(\tilde\gamma)-\mathcal L_i(\mathbf1)$. Let
+$U_{1-\eta}$ be a one-sided source-bootstrap upper bound for
+$\mathbb E[\Delta]$. The deployed gate is
+\begin{equation}
+\gamma^{\method}=\begin{cases}
+\tilde\gamma, & U_{1-\eta}\le\delta_{\rm NI},\\
+\mathbf1, & \text{missing/failed certificate},
+\end{cases}
+\label{eq:guard}
+\end{equation}
+with conservative default $\delta_{\rm NI}=0$. The certificate is bound to
+the model revision, condition site, sampler, domain, metric, and candidate
+vector in the run manifest. This domain guard is the correction required by
+the DAVIS-to-SSv2 reversal.
+
+\subsection{Benefit--disruption derivation}
+At step $s$, let $B_s\ge0$ be terminal binding benefit and $D_s\ge0$ prior
+disruption. The separable surrogate
+\begin{equation}
+J_s(\gamma_s)=(1-\gamma_s)^2B_s+\gamma_s^2D_s
+\label{eq:tradeoff}
+\end{equation}
+has minimizer
+$\gamma_s^\star=B_s/(B_s+D_s)$ when $B_s+D_s>0$. For $B_s,D_s>0$ this is
+$\sigma(\log B_s-\log D_s)$, with zero endpoints obtained by continuity.
+A local log-linear model
+$\log(B_s/D_s)=\alpha(\lsnr_s-\tau)$ yields
+Eq.~\eqref{eq:regimegate}; when both terms vanish, ANCHOR abstains rather
+than assigning an arbitrary optimum.
+
+\begin{proposition}[Hard skip as the sharp-gate limit]\label{prop:zero}
+If $\lsnr_s$ is strictly increasing and
+$\tau\in(\lsnr_K,\lsnr_{K+1})$, then as $\alpha\to\infty$,
+$\sigma(\alpha(\lsnr_s-\tau))\to\mathbb 1[s>K]$ pointwise, i.e.\ the
+first $K$ execution-order steps are skipped.
+\end{proposition}
+\begin{proof}
+The sigmoid argument tends to $-\infty$ below $\tau$ and $+\infty$ above
+it; strict monotonicity excludes equality.
+\end{proof}
+
+\begin{proposition}[Guarded calibration non-inferiority]\label{prop:guard}
+For a fixed candidate and realized calibration sample, Eq.~\eqref{eq:guard}
+either returns Native-Full exactly or deploys a candidate whose reported
+one-sided bound is at most $\delta_{\rm NI}$. If sources are i.i.d. from the
+deployment domain and the bootstrap bound has coverage $1-\eta$, then the
+same confidence statement transfers to the domain mean.
+\end{proposition}
+\begin{proof}
+The fallback branch is identical to Native-Full. The deployment branch is
+entered only when its computed bound passes the stated inequality; the
+population statement is exactly the assumed coverage event.
+\end{proof}
+This is a distributional calibration guarantee, not pointwise immunity to
+domain shift. The fixed SSv2 failure rules out the stronger ``never worse on
+every request'' claim.
+
+\paragraph{Current execution status.}
+The selector and paired estimator are implemented and tested.
+The signed probe was executed on CogVideoX-5b-I2V with five DAVIS
+calibration sources (probe parameters, revision, seeds, and generation
+counts in the supplement).
+Mean source-level $S{=}-27.2$; 95\% BCa CI $[-292.1, +243.9]$ (seed 2027,
+$B{=}10^4$; the five per-source $S$ values are in the supplement).
+The interval crosses zero: the classifier returns \textsc{Uncertain},
+correctly abstaining rather than forcing a binary verdict.
+E4 does not estimate $R$ and is not SSv2 target-domain evidence.
+Separately, a locked DAVIS 10{+}10 lane completed: train promotion
+calibration (mean $-0.120$, BCa 95\% upper $-0.052{<}0$; $9/10$) and
+held-out val evaluation (mean $-0.154$, BCa 95\%
+$[-0.202,-0.108]$, upper $-0.108\le\delta_{\rm NI}{=}0$; $10/10$).
+The locked candidate is skip-$K{=}8$; its legacy nomination grid froze
+only the hypothesis, and every certificate number comes from the
+identity-matched rerun on the locked revision (provenance in the
+supplement).
+Under Eq.~\eqref{eq:guard} this is a DAVIS-domain deployment certificate
+for the locked candidate (Tab.~\ref{tab:davis}); it is \emph{not} an SSv2
+certificate and does not rewrite Tab.~\ref{tab:main}.
+The SSv2 calibration split still has no generated candidate results; its
+replay therefore returns Native-Full exactly (Sec.~\ref{sec:protocol}),
+auditing abstention rather than adaptive improvement.
+
+\subsection{Optional linearized schedule optimizer}
+Let $e=\phi(a)-\phi(\hat x_p(\bar\gamma))$ be the target residual under
+the reference schedule, $G=[G_1,\ldots,G_T]$, $L$ the stacked leakage
+operator, $D$ the first-difference matrix, and
+$\mathcal B=\{\delta\gamma: 0\le\bar\gamma+\delta\gamma\le 1\}$. The
+candidate \method\ formulation solves
+\begin{equation}
+\begin{aligned}
+\min_{\delta\gamma\in\mathcal B}\quad
+&\tfrac12\|e-G\delta\gamma\|_W^2
++\tfrac{\lambda}{2}\|L\delta\gamma\|_2^2\\
+&+\tfrac{\beta}{2}\|D(\bar\gamma+\delta\gamma)\|_2^2
++\tfrac{\mu_0}{2}\|\delta\gamma\|_2^2 .
+\end{aligned}
+\label{eq:qp}
+\end{equation}
+The first three terms represent missed anchor, copy/freeze leakage, and
+brittle switching; the final ridge makes numerical identifiability explicit.
+\begin{theorem}[Unique optimum of the linearized objective]\label{thm:qp}
+Let $Q=G^\top WG+\lambda L^\top L+\beta D^\top D+\mu_0 I$ with any ridge
+$\mu_0>0$ (the implementation scales it to the unridged Hessian; without it,
+$Q\succ0$ iff $\mathbf 1\notin\ker(WG)\cap\ker L$, since
+$\ker D^\top D=\mathrm{span}\{\mathbf 1\}$). Then Eq.~\eqref{eq:qp} has a
+unique solution; without box constraints
+$\delta\gamma^{\star}=Q^{-1}(G^\top We-\beta D^\top D\bar\gamma)$, and with
+them the optimum is the $Q$-metric projection of $\delta\gamma^\star$ onto
+$\mathcal B$.
+\end{theorem}
+\begin{proof}
+Strict convexity with Hessian $Q\succ0$; stationarity gives the closed
+form; the box case is
+$\arg\min_{x\in\mathcal B}\|x-\delta\gamma^\star\|_Q$, i.e.\ the
+$Q$-projection.
+\end{proof}
+
+\subsection{Closed-form residual-feedback candidate}
+Solving Eq.~\eqref{eq:qp} needs the full response map. The feedback form
+needs only the current trajectory. At checkpoint $s$ we adopt the
+\emph{null-continuation reference}: executed steps keep their realized
+gates and all remaining steps default to $\gamma{=}0$, so the decision
+variable is the absolute injection level and
+$e_s=\psi(z_a)-\psi(\hat z_{0|s,p})$ is the residual if injection stopped
+now. This convention yields a one-coordinate receding-horizon surrogate of
+Eq.~\eqref{eq:qp}; mixing it with a nonzero-reference residual systematically
+over-injects (we verified both readings in simulation; the wrong one loses
+even to zero injection). With the complete two-sided difference penalty,
+each fixed-zero adjacent edge contributes another quadratic denominator
+term; the lightweight rule retains only the realized-neighbor edge and is
+not the exact full-QP coordinate solve.
+With calibrated per-step response direction $g_s$ and leakage energy
+$\ell_s^2$,
+\begin{equation}
+\min_{0\le\gamma\le1}
+\tfrac12\|e_s-\gamma g_s\|_2^2
++\tfrac{\lambda}{2}\gamma^2\ell_s^2
++\tfrac{\rho_s}{2}(\gamma-\gamma_{s+1})^2
+\label{eq:local}
+\end{equation}
+has the exact solution
+\begin{equation}
+\gamma_s^{\star}=\proj\!\left(
+\frac{\langle g_s,e_s\rangle+\rho_s\gamma_{s+1}}
+{\|g_s\|_2^2+\lambda\ell_s^2+\rho_s}
+\right).
+\label{eq:gate}
+\end{equation}
+Corrective alignment increases injection; weak interfaces, high leakage,
+and schedule roughness shrink it; negative alignment shuts it off. The
+proposed residual would be decoded every $R$ steps and interpolated between
+checkpoints. This online update was not implemented in the reported video
+experiment; its Fixed-Response Gate instead used one precomputed schedule
+for every source and seed.
+\begin{proposition}[One-step descent]\label{prop:descent}
+Let $a_s=[\langle g_s,e_s\rangle+\rho_s\gamma_{s+1}]_+$,
+$d_s=\|g_s\|^2+\lambda\ell_s^2+\rho_s$, and suppose the true local
+objective is upper-bounded by the surrogate plus $\kappa_s\gamma^2/2$
+(Assumption~\ref{ass:smooth} gives
+$\kappa_s\le\kappa_F\|g_s\|C_\psi$). Using denominator $d_s+\kappa_s$
+with $a_s\le d_s+\kappa_s$,
+$\tilde J_s(\gamma_s^\star)-\tilde J_s(0)\le -a_s^2/\bigl(2(d_s+\kappa_s)\bigr)$.
+\end{proposition}
+In practice $\kappa_s$ is replaced by a bootstrap upper confidence bound
+from a probe-radius sweep; the guarantee holds when the UCB covers the
+truth.
+
+\subsection{Response-map stability and stopping rule}
+Rademacher probes $v^{(j)}\in\{\pm1\}^T$ around $\bar\gamma$ yield paired
+differences $\Delta y^{(j)}\approx Gv^{(j)}$; we recover smooth curves by
+the ridge estimator
+$\widehat G=YV^\top(VV^\top+\mu D_2^\top D_2)^{-1}$
+($D_2$: second difference), provided the kernel condition checked in
+the supplement holds. Estimation
+error propagates to the controller as follows.
+\begin{theorem}[Calibration stability]\label{thm:stability}
+If $Q\succeq\mu I$, $\mu>0$, and $\|\Delta Q\|_2<\mu$, then the estimated
+unconstrained controller satisfies
+\begin{equation}
+\|\widehat{\delta\gamma}-\delta\gamma^\star\|_2\le
+\frac{\|\Delta b\|_2+\|\Delta Q\|_2\|\delta\gamma^\star\|_2}
+{\mu-\|\Delta Q\|_2}.
+\label{eq:stability}
+\end{equation}
+\end{theorem}
+\begin{proof}
+$(Q+\Delta Q)(\widehat{\delta\gamma}-\delta\gamma^\star)=\Delta b-\Delta
+Q\,\delta\gamma^\star$ and
+$\sigma_{\min}(Q+\Delta Q)\ge\mu-\|\Delta Q\|_2$.
+\end{proof}
+The box-constrained extension requires care because the two projections
+live in different metrics; the supplement states the extra
+$\sqrt{\kappa(Q)}$ and metric-perturbation terms explicitly. Probing stops
+when a bootstrap upper bound on the right-hand side of
+Eq.~\eqref{eq:stability} falls below a frozen tolerance
+$\epsilon_\gamma$; if that fails within the probe budget, a future online
+controller would be reported as unsupported on that interface.
+
+\subsection{Open-loop gates as a special case}
+\begin{lemma}[Open-loop reduction]\label{lem:openloop}
+If $e_s,g_s,\ell_s$ are deterministic functions of $\lsnr_s$ and
+$h(\lsnr_s)=\langle g,e\rangle/(\|g\|^2+\lambda\ell^2+\rho)$ is monotone,
+Eq.~\eqref{eq:gate} is a monotone schedule in $\lsnr$; a logistic fit
+recovers the fixed sigmoid family, and hard skip-$K$ is its
+$\alpha\to\infty$ limit.
+\end{lemma}
+The lemma predicts both sides of the evidence: \emph{within} an interface
+whose response is a stable function of $\lsnr$, a frozen threshold should
+transfer across sampler discretizations---and it does
+(Sec.~\ref{sec:diag}); \emph{across} interfaces with different response
+structure, a fixed gate need not transfer---as the executed diagnostics and
+SSv2 stress test demonstrate.
+
+\section{Executed Interface Diagnostics}
+\label{sec:diag}
+All numbers below are executed diagnostics with stated scope (fixed seed,
+one prompt, $T{=}30$ unless noted, $480{\times}720{\times}49$); they serve
+to calibrate and motivate, and are kept separate from the completed SSv2
+stress test of Sec.~\ref{sec:protocol}. Sources: immutable result files in
+the project registry.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_davis_tierc_dense_2x4.pdf}
+\caption{DAVIS~2017 first-frame gallery (dense $2\times4$; unmodified
+dataset frames used as probe sources).}
+\label{fig:davis-dense-gallery}
+\end{figure}
+
+\paragraph{Evidence status.}
+The regime names below summarize executed swap and skip curves, not
+outputs of Eq.~\eqref{eq:classify}; the signed component is
+\textsc{Uncertain}, a full regime label is unavailable, and VACE has no
+valid signed probe (full paragraph in the supplement).
+
+\begin{table}[t]\centering\small
+\setlength{\tabcolsep}{2.6pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+Interface (backbone) & Cond.\ site & Swap resp. & $n$ & Best $K$ & Skip effect\\
+\midrule
+Concat (CogVideoX-5B) & interior$^{a}$ & --- & 10 & $9$--$10$ & $-28\%$ err\\
+Concat (CogVideoX-5B) & boundary & $0.955{\pm}0.030$ & 5 & --- & ---\\
+Concat (Wan2.2-TI2V) & boundary & $0.973{\pm}0.024$ & 5 & n/a$^{b}$ & n/a\\
+Mask (VACE-1.3B) & interior & $0.954{\pm}0.028$ & 5 & $1$ & $+93\%$ vs. full$^{c}$\\
+Token (LTX-Video) & interior & $0.040{\pm}0.009$ & 5 & --- & wall\\
+\bottomrule
+\end{tabular}}
+\caption{Interface interventions with \emph{disclosed conditioning sites}:
+``interior'' places the condition at frame $p{=}24$ through the native
+mechanism (CogVideoX latent slot / VACE video+mask / LTX
+\texttt{frame\_index}); ``boundary'' is the official first-frame path with
+the response read out at frame $24$ (propagated influence, a different
+estimand). $^{a}$Interior concat reachability is evidenced by execution
+(skip-$K$ grid), not by a swap ratio. $^{b}$Wan2.2-TI2V~\citep{wan2025wan22} exposes only
+first-frame conditioning; no native interior interface exists to sweep.
+$^{c}$The $+93\%$ comparison is $K{=}12$ versus full conditioning
+($K{=}0$), not versus the empirical optimum $K{=}1$.
+Same seed and prompt throughout; resolutions/steps per backbone in the
+supplement. The same delayed-re-assertion family helps the concat interface,
+hurts the mask interface ($0.145\!\to\!0.281$ anchor LPIPS from $K{=}0$ to
+$K{=}12$, $n{=}10$), and is vacuous at the token wall.}
+\label{tab:interfaces}
+\end{table}
+
+The real UCF-101 dataset context, full interface-response curves, and
+descriptive three-anchor refresh pilot are deferred to the supplement;
+none is used as headline method evidence.
+
+
+\paragraph{Reachability across interfaces.}
+Five fixed-seed anchor-swap pairs per backbone with disclosed conditioning
+sites (Tab.~\ref{tab:interfaces}). \emph{Interior} swaps: VACE
+$0.9543{\pm}0.0284$ (seed $42$; cross-seed replication at seeds $0,1$ and
+per-pair values in the supplement) versus LTX $0.0400{\pm}0.0093$---a $24\times$ gap
+between two native interior mechanisms under matched seed and prompt. LTX is
+the wall candidate; before the label sticks, the hook-isolation audit must
+exclude an implementation-level explanation---a deliberately falsifiable
+step listed in the protocol. \emph{Boundary} swaps read out at frame $24$
+measure propagated influence and are reported separately: CogVideoX
+$0.9551{\pm}0.0303$, Wan2.2 $0.9727{\pm}0.0236$; interior concat
+reachability on CogVideoX is instead evidenced by execution (anchor LPIPS
+$0.31$--$0.43$ across the interior $K$ grid, far below the
+no-conditioning regime). VACE's \emph{native-null} control generates with
+the fully-masked path and lands far from the anchor (anchor LPIPS $0.833$
+mean, $n{=}5$, range $0.739$--$0.893$), confirming the conditioned
+response is not an artifact of the null path leaking content.
+
+\paragraph{In-interface transfer of the open-loop gate.}
+On CogVideoX, freezing $\tau{=}-4.495$ from the $T{=}30$ calibration and
+re-deriving $K^\star=|\{s:\lsnr_s<\tau\}|$ at $T{=}50$ predicts
+$K^\star{=}9$; the empirical panel optimum is $K{=}10$ (anchor LPIPS
+$0.3092$ vs.\ $0.4274$ at $K{=}0$, $n{=}10$; per-clip W/T/L $8/0/2$),
+inside the stated panel-mean
+$\pm2$ window. This is a panel-level observation, not a per-clip transfer
+guarantee; the $K{=}9$ point itself is unverified, the gate---not the
+integer---is the transfer hypothesis, and its current support is
+DDIM-only (DPM-Solver status in the supplement).
+
+\paragraph{Anchor-position generalization.}
+At non-central anchors (frames $12$ and $36$) the same frozen gate has
+lower observed anchor LPIPS on every evaluated clip (skip-$5$ vs.\ full,
+$n{=}10$, $10/10$ clips improve at both positions); per-position values
+are in the supplement.
+
+\paragraph{Mask-interface reversal.}
+On VACE, dense sampling reveals the empirical optimum at $K{=}1$, narrowly
+beating full conditioning, then degrading monotonically through $K{=}12$
+($+93\%$ vs.\ full; Tab.~\ref{tab:interfaces}); every sampled clip prefers
+$K{\le}2$ to $K{\ge}3$. Mechanistically, the mask interface persists the
+anchor across steps, so early omission removes the only signal that
+localizes the keyframe---the opposite failure mode of the concat
+interface, where early injection over-constrains global layout. The
+$K{=}1$ optimum demonstrates a local schedule effect, not evidence for
+online feedback; the full per-$K$ curve, off-target distances, and
+per-clip examples are in the supplement.
+
+\paragraph{Cross-domain pilots (descriptive).}
+The Wan2.2 DAVIS/anime probes, an indoor sanity check, and the UCF-101
+probe---which replicates the VACE mask-interface reversal outside short
+narrative scenes---are reported in full in the supplement.
+
+\section{Simulation Checks of the Linearized Formulation}
+\label{sec:sim}
+Before any video experiment, we stress the mathematics on cheap synthetic
+systems; the cost comparisons, stability- and descent-check counts,
+probe-budget recovery curves, adversarial extension, and protocol are in
+the supplement. Simulation checks mathematics, not video effectiveness.
+
+\section{SSv2: Fixed-Gate Failure and Guarded Replay}
+\label{sec:protocol}
+\paragraph{Executed design.}
+The completed SSv2 panel contains $27$ source clips with two seeds per
+source, all on \textbf{CogVideoX-5B-I2V's interior concat interface}
+($480{\times}720$, $49$ frames, DDIM, $T{=}30$). Four schedules were executed: Native-Full,
+Best-Calibration-SkipK, RAS-OpenLoop-LogSNR, and a Fixed-Response Gate. The
+last arm used one fixed gamma schedule for every source and seed, with no
+trajectory residual decode or update, and therefore is not the online
+feedback rule of Sec.~\ref{sec:method}. The raw manifest's original arm name
+(ANCHOR-Feedback) misdescribed this fixed vector; the supplement
+documents the correction to Fixed-Response Gate and the full $\gamma$ vector.
+The immutable raw manifest's full SHA-256, the raw runner, and all four
+numeric vectors are disclosed in the supplement.
+Frame Guidance~\citep{jang2025frameguidance}, \method-QP, true online \method-Feedback, the SSv2
+target-domain signed probe, and the $2{\times}2$ interface--domain control
+were not executed. The completed CogVideoX/DAVIS E4 probe is a separate
+source-domain diagnostic and returns an \textsc{Uncertain} signed component.
+
+\begin{table}[t]\centering\scriptsize
+\setlength{\tabcolsep}{2pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Method & Anchor LPIPS$\downarrow$ & source $\Delta$ BCa 95\% CI & run W/T/L\\
+\midrule
+Native-Full & \textbf{0.228} & --- & ---\\
+Fixed-Response Gate & 0.872 & $[0.587,0.690]$ & $0/0/54$\\
+Best-Calibration-SkipK & 0.926 & $[0.642,0.744]$ & $0/0/54$\\
+RAS-OpenLoop-LogSNR & 0.931 & $[0.647,0.748]$ & $0/0/54$\\
+\method{} abstention replay$^\dagger$ & \textbf{0.228} & identity & $0/54/0$\\
+\bottomrule
+\end{tabular}}
+\caption{SSv2 source-level reanalysis. Seeds are averaged within each of
+$27$ sources before paired BCa inference; W/T/L is over the $54$ seeded
+runs versus Native-Full. Mean differences are $0.645/0.698/0.703$ for the
+three fixed gates; all Holm-adjusted sign-flip $p=1.50\times10^{-4}$.
+$^\dagger$No new SSv2 videos: the SSv2 signed probe and SSv2 calibration
+are still absent, so Eq.~\eqref{eq:guard} returns the exact Native-Full
+vector and reuses its records. The DAVIS 10{+}10 certificate in
+Table~\ref{tab:davis} does not transfer to SSv2. This row audits SSv2
+safety behavior, not adaptive effectiveness.}
+\label{tab:main}
+\end{table}
+
+\begin{table}[t]\centering\scriptsize
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccc@{}}
+\toprule
+DAVIS locked lane & Anchor LPIPS$\downarrow$ & source $\Delta$ BCa 95\% CI & W/T/L\\
+\midrule
+Native-Full (val, $n{=}10$) & $0.518$ & --- & ---\\
+Candidate after cal.\ gate (val) & $\mathbf{0.364}$ & $[-0.202,-0.108]$ & $10/0/0$\\
+\midrule
+Cal.\ gate (train, $n{=}10$) & --- & $[-0.220,-0.052]$ & $9/0/1$\\
+\bottomrule
+\end{tabular}}
+\caption{CogVideoX/DAVIS 10{+}10 locked paired lane (anchor LPIPS at
+$f{=}24$; $\Delta=$candidate$-$native; negative favors candidate).
+Train promotion calibration and held-out val evaluation both clear
+$U_{1-\eta}\le\delta_{\rm NI}{=}0$ in Eq.~\eqref{eq:guard}. Val mean
+$\Delta{=}-0.154$. This is a DAVIS-domain certificate only; it is not an
+E4 signed-regime result and not an SSv2 certificate.}
+\label{tab:davis}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.7\textwidth]{figures/fig_davis_locked_lane_singlecol.pdf}
+\caption{\textbf{Locked-anchor timeline grammar (qualitative).}
+$(a)$--$(f)$: $3{\times}2$ dense 4-frame strips on clean DAVIS scenes
+(\texttt{car-roundabout}, \texttt{blackswan}). Yellow marks condition
+frames; method tags are Native / Skip-$K$ / RAS / \textbf{Ours}
+(Candidate). Unmodified GT (no POND5). Paired LPIPS remains
+Table~\ref{tab:davis}.}
+\label{fig:davis-locked-lane}
+\end{figure*}
+
+Fig.~\ref{fig:davis-locked-lane} illustrates the locked-anchor interface
+with dense 4-frame strips; the numerical DAVIS certificate is
+Table~\ref{tab:davis}.
+
+\paragraph{Endpoint interpretation.}
+Anchor LPIPS measures target-frame distance to the anchor (lower is
+better); the renamed runner fields---off-target anchor distance and a
+gray-frame-difference proxy---are documented in the supplement and are
+not used as semantic leakage or motion endpoints.
+
+\paragraph{E0: the failure is a same-interface domain reversal.}
+The manifest resolves the undisclosed backbone as CogVideoX concat; DAVIS
+and SSv2 disagree even though the interface is fixed, which is what forces
+Stage~3 domain certification. The missing VACE$\times$SSv2 arm prevents a
+$2{\times}2$ interaction claim (paired values in the supplement).
+
+\paragraph{E1: what the replay does and does not establish.}
+The $13$-source calibration manifest has no candidate generations; with no
+SSv2 signed probe or certificate, the selector returns $\mathbf1$ and
+exactly reuses all $54$ Native-Full outputs. The completed DAVIS E4 run
+supplies neither target-domain evidence nor a directional regime for $S$.
+This audits fallback software, not adaptive effectiveness; a nontrivial
+arm still needs a locked SSv2 probe and independent calibration.
+
+\paragraph{E6 and model-identity audit scope.}
+E6 identified a backbone/harness conflict, so the two training harnesses
+cannot be pooled and the learned-repair claim is withdrawn pending a
+matched rerun; the SSv2 model-identity audit covers name and revision
+labels but no cryptographic weights digest. Both paragraphs are reported
+in full in the supplement.
+
+\section{End-to-end Pipeline Test}
+\label{sec:e2e}
+The submission validated components in isolation; this revision closes
+the loop on a small, disclosed case (three calibration + three held-out
+DAVIS sources, CogVideoX-5B-I2V, $T{=}30$, $p{=}24$, one prompt, seed
+42; released reference implementation). The signed paired probe
+($m{=}4$ pairs per source) classified the pair as \textsc{Persistent}
+($S{=}{+}0.26/{+}1.18/{+}1.40$; $R{=}0.211/1.312/1.465$; $S$ lower
+bound $0.262>0$), and the regime automatically proposed the
+micro-skip $K{=}1$ candidate---no schedule was nominated by hand. On
+the three calibration sources the candidate-minus-native anchor-LPIPS
+deltas were $+0.034/-0.036/-0.056$; the one-sided source-bootstrap
+upper bound was $+0.011>\delta_{\rm NI}{=}0$, so Eq.~\eqref{eq:guard}
+abstained and the deployed output is exactly Native-Full. A post-veto
+diagnostic (not a deployment) evaluated the vetoed candidate on the
+three held-out sources: it was worse on all three ($\Delta$LPIPS
+$+0.096/+0.377/+0.049$; mean $+0.174$; $\Delta$DINOv2 $-0.431$), so
+the veto was protective rather than costly. The pipeline therefore
+executes end-to-end---probe, classify, propose, certify, abstain---but
+it does not produce an adaptive win on this panel; a positive E2E case
+remains open and is listed in the limitations. Cost: $30$ generations
+($24$ probe $+$ $6$ guard), $5{,}521$\,s wall-clock on one A100-80\,GB,
+$164.4{\pm}1.0$\,s per generation, $37.5$\,GB peak; certificates
+amortize this one-off cost (Sec.~\ref{sec:method}).
+
+\section{Limitations, Ethics, and Practice}
+\looseness=-1
+A keyframe underdetermines its surrounding video. The interface panel is
+small and mostly single-prompt/single-seed; only SSv2 has $27$ sources and two
+seeds. E4 produced a genuine \textsc{Uncertain} verdict (CI crosses zero; 3/5
+sources negative, 2/5 positive), demonstrating the fourth classifier state
+is empirically reachable, not merely theoretical. E4 covers only five
+DAVIS sources and only the signed $S$ component; $R$, VACE/SSv2 signed
+probes, target-domain candidates, the $2{\times}2$ control, Frame
+Guidance, QP, and online feedback remain unexecuted, so the adaptive row
+is an identity audit.
+Off-target anchor distance and gray-frame difference
+are not validated leakage or motion, and synthetic results are not video
+evidence. Public datasets may contain identifiable people and copyrighted
+media; we follow licenses, release manifests/metrics rather than restricted
+media, document removals, and gate human evaluation on institutional review.
+\emph{Practitioner takeaway}: for interior-keyframe editing, first test
+whether the exact native interface reaches the requested frame, then
+certify the proposed schedule against Native-Full on the target domain; if
+either test is missing or ambiguous, use Native-Full.
+
+\paragraph{No human perceptual study in this revision.}
+All headline numbers are automatic: anchor LPIPS at the target frame
+and source-level bootstrap intervals. They measure distance to the
+requested image, not perceived identity, motion naturalness, or
+authoring acceptability. We did not run a mean-opinion-score study, so
+no claim in this paper should be read as a perceptual preference; a
+preregistered study (identity, motion, perceived drift; $n$, scale,
+confidence intervals, inter-rater agreement) remains future work and
+its absence is a key limitation. The same limitation applies to
+temporal quality: anchor LPIPS cannot see flicker, frame leakage, or
+motion collapse. Clip-level temporal-consistency checks (adjacent-frame
+embedding similarity and flow-based smoothing, following the
+VBench/VBench++ axes) are specified in the released evaluation code,
+but they were \emph{not} executed on the ANCHOR panels in this
+revision; no motion-quality claim is made from them, and running them
+on the released videos is a listed next step.
+
+\section{Conclusion}
+\looseness=-1
+Concat, mask, and token interfaces respond in qualitatively different ways,
+and CogVideoX's SSv2 stress test shows that a schedule can reverse across
+domains even with the interface fixed ($0/54$ wins; $3.83\times$
+mean anchor LPIPS). ANCHOR therefore probes, classifies only with separated
+confidence intervals, and certifies on-domain before deviating from
+Native-Full.
+The completed five-source DAVIS signed probe returns \textsc{Uncertain}, not
+a favorable regime; the fallback is implemented exactly, while nontrivial
+adaptive and online video gains remain open empirical requirements.
+
+\clearpage
+\bibliography{references}
+
+\end{document}

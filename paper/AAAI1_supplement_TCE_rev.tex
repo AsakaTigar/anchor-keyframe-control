@@ -1,0 +1,215 @@
+%% Technical supplement for the ANCHOR TCE revision.
+%% Compile: pdflatex AAAI1_supplement_v1 && pdflatex AAAI1_supplement_v1
+\documentclass[letterpaper]{article}
+\usepackage[submission]{aaai2027}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{xr}
+\externaldocument{AAAI1_main_v5}
+\urlstyle{rm}
+\frenchspacing
+\setcounter{secnumdepth}{2}
+
+\title{Technical Supplement:\\
+ANCHOR: Probe, Classify, Gate}
+\author{Anonymous Submission}
+\affiliations{}
+
+\begin{document}
+\maketitle
+\appendix
+
+\section{Interface conditioning sites}
+\label{sec:supp-sites}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+interface & backbone & conditioning site & response estimand\\
+\midrule
+Concat & CogVideoX-5B-I2V & interior latent slot at $p$ & interior swap response\\
+Mask & VACE-1.3B & video + mask at frame $p$ & interior swap response\\
+Token & LTX-Video & token interface (\texttt{frame\_index}) & interior swap response\\
+Boundary & CogVideoX / Wan2.2 & official first frame, readout at $p$ & propagated influence\\
+\bottomrule
+\end{tabular}
+\caption{Conditioning sites. Interior and boundary rows are different
+estimands and are never pooled.}
+\end{table}
+
+\section{Generation protocol and arm definitions}
+
+\paragraph{Protocol.} CogVideoX-5B-I2V, $480{\times}720$, 49 frames,
+DDIM, $T{=}30$, one fixed prompt per panel, seeds $42$ and $123$ where
+two seeds are reported. The requested interior frame is $p{=}24$.
+Boundary rows use the official first-frame path and read out at frame
+$24$; they measure propagated influence.
+
+\paragraph{Arms.}
+\begin{itemize}
+\item Native-Full: $\gamma_s\equiv1$ (official pipeline; the fallback).
+\item Best-Calibration-SkipK: hard skip-$K$, $K$ selected on the
+  calibration grid; $\gamma_s=\mathbb 1[s>K]$.
+\item RAS-OpenLoop-LogSNR: $\gamma_s=\sigma(\alpha(\log\mathrm{SNR}_s-\tau))$
+  with $(\alpha,\tau)$ frozen before target evaluation ($\tau{=}-4.495$
+  from the $T{=}30$ calibration).
+\item Fixed-Response Gate: one frozen $\gamma$ vector for every source
+  and seed; \emph{not} the online feedback rule (the raw manifest's
+  original arm name is corrected in the run notes).
+\item ANCHOR (deployed): the regime candidate if the target-domain
+  guard certifies it; otherwise $\gamma\equiv1$ exactly.
+\item ANCHOR abstention replay: the Native-Full records are reused; this
+  row audits fallback behaviour, not adaptive gain.
+\end{itemize}
+
+\section{Probe protocol, classifier, and guard}
+
+\paragraph{Probe.} Rademacher design $v_j\in\{-1,1\}^T$, symmetric
+perturbation $\bar\gamma\pm\varepsilon v_j$, paired differences
+$Y_j=(\phi(x_j^+)-\phi(x_j^-))/(2\varepsilon)$, ridge recovery with a
+second-difference penalty:
+$\widehat G=YV^\top(VV^\top+\mu D_2^\top D_2)^{-1}$.
+Released defaults: $\varepsilon{=}0.1$, $\mu{=}10^{-2}$, $m{=}24$
+(recovery poor at $m{=}8$, improving to $m{=}24$); early window
+$K_0=\lceil T/6\rceil$; $2m$ forward passes per pair with no
+back-propagation.
+
+\paragraph{Classifier (Eq.~3 of the main paper).} Bounds are two-sided
+95\% source-level BCa intervals ($B{=}10^4$, seed 2027); the noise floor
+is $h=3\hat\sigma^2_{\rm probe}$. Wall: $R_{\rm hi}<h$; Persistent:
+$R_{\rm lo}\ge h$, $S_{\rm lo}>0$; Droppable: $R_{\rm lo}\ge h$,
+$S_{\rm hi}\le0$; otherwise Uncertain.
+
+\paragraph{Guard (Eq.~6).} Frozen candidate; seeds averaged within each
+calibration source; one-sided source-bootstrap upper bound $U_{1-\eta}$
+on $\mathbb E[\Delta]$, $\Delta_i=\mathcal L_i(\tilde\gamma)-\mathcal L_i(\mathbf 1)$;
+deploy iff $U_{1-\eta}\le\delta_{\rm NI}$ (default $0$), else
+$\gamma\equiv\mathbf 1$.
+
+\section{Status of each component on the executed panels}
+\label{sec:supp-status}
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.30\textwidth}p{0.34\textwidth}p{0.26\textwidth}@{}}
+\toprule
+component & executed evidence & status\\
+\midrule
+Probe (signed $S$) & CogVideoX/DAVIS, 5 sources, seed 2027: $S{=}-27.2$, BCa $[-292.1,243.9]$ & Uncertain (CI crosses 0)\\
+Classifier & four states implemented; Uncertain returned by E4 & implemented, one state exercised\\
+Guard & DAVIS 10+10 locked lane: train $-0.120$ ($U{=}-0.052$), val $-0.154$ $[-0.202,-0.108]$ & certificate passed\\
+Candidate deployment & locked skip-$K{=}8$ (manual nomination in submission) & E2E test in revision (Sec.~\ref{sec:supp-e2e})\\
+SSv2 adaptive arm & no candidate generations & abstention replay only\\
+\bottomrule
+\end{tabular}
+\caption{Component status. The submission's gap---no end-to-end case
+where the probe selects the regime and the guard certifies the
+resulting candidate---is addressed by the revision experiment in
+Sec.~\ref{sec:supp-e2e}.}
+\end{table}
+
+\section{End-to-end pipeline test (revision)}
+\label{sec:supp-e2e}
+
+\paragraph{Design.} Six DAVIS first-frame sources (three calibration,
+three held-out), one fixed prompt, seed 42, $T{=}30$, $p{=}24$,
+$480{\times}720{\times}49$. The pipeline is executed by the released
+reference implementation: (1) signed paired probe with $m{=}4$ Rademacher
+pairs per calibration source; (2) classifier; (3) regime candidate
+(micro-skip for Persistent, log-SNR for Droppable) or abstention;
+(4) target-domain guard on the three calibration sources; (5) if
+certified, evaluation on the three held-out sources. The metric is
+anchor LPIPS at frame $p$ (LPIPS-Alex, the paper's metric) with DINOv2
+CLS cosine as a second readout. The anchor swap used by the probe is a
+symmetric photometric perturbation of the anchor; it is disclosed as a
+proxy for a semantic anchor pair.
+
+\paragraph{Result.} The probe classified the pair as
+\textsc{Persistent}: per-source $(R,S)=(0.211,{+}0.26)$,
+$(1.312,{+}1.18)$, $(1.465,{+}1.40)$; the source-bootstrap lower bound
+on $S$ is $0.262>0$ and $R_{\rm lo}=0.211\gg h=0.002$. The regime
+then \emph{automatically} proposed micro-skip $K{=}1$ (no manual
+nomination). On calibration, candidate-minus-native anchor-LPIPS
+deltas were $+0.034/-0.036/-0.056$; the one-sided upper bound is
+$+0.011>\delta_{\rm NI}{=}0$, so the guard abstained and the deployed
+vector is $\gamma\equiv\mathbf 1$ exactly.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}p{0.32\columnwidth}p{0.62\columnwidth}@{}}
+\toprule
+stage & outcome\\\midrule
+probe ($m{=}4$, 3 sources) & \textsc{Persistent}; $S_{\rm lo}{=}0.262$, $R_{\rm lo}{=}0.211$\\
+candidate & micro-skip $K{=}1$ (automatic)\\
+guard ($\delta_{\rm NI}{=}0$) & deltas $+0.034/-0.036/-0.056$; $U{=}{+}0.011$ $\Rightarrow$ abstain\\
+deployed & Native-Full ($\gamma\equiv\mathbf 1$)\\
+post-veto held-out & $\Delta$LPIPS $+0.096/+0.377/+0.049$ (3/3 worse); mean $+0.174$\\
+post-veto held-out & $\Delta$DINOv2 $-0.431$ (3/3 worse)\\
+cost & 30 generations, 5{,}521\,s, $164.4{\pm}1.0$\,s/gen, 37.5\,GB peak\\
+\bottomrule
+\end{tabular}
+\caption{Revision end-to-end test on CogVideoX-5B-I2V. The pipeline
+executes probe $\to$ classify $\to$ propose $\to$ certify; the guard
+vetoes, and a post-veto diagnostic (not a deployment) shows the veto
+was protective on all three held-out sources. This validates the
+software path, not an adaptive win.}
+\end{table}
+
+\paragraph{Temporal sanity metrics.} On the saved guard-video frames
+(every 4th frame, 13 per video) we computed adjacent-frame DINOv2
+consistency and Farneback motion. Mean temporal consistency is $0.930$
+(native) vs.\ $0.928$ (vetoed candidate); mean motion magnitude is
+$4.00$ vs.\ $4.01$; per-source values range $0.882$--$0.989$ and
+$2.63$--$4.77$. These are sanity numbers on $n{=}3$ sources, not a
+quality claim, and they are included to make the metric stack complete
+rather than to rank arms.
+
+\paragraph{Environment sensitivity (disclosed).} The same probe run on
+the earlier GDUT a100 environment gave $(R,S)=(0.453,{+}0.09)$ for
+source~1 and $(2.496,-1.39)$ for source~2; the HZU environment gives
+$(0.211,{+}0.26)$ and $(1.312,{+}1.18)$. Source~1's sign agrees,
+source~2's flips, so the signed statistic is not numerically portable
+across stack versions at this scale. This reinforces the paper's rule
+that a certificate is bound to model revision, sampler, and
+environment, and that any change reverts to \textsc{Uncertain}.
+
+\section{Code release and reproduction}
+\label{sec:supp-code}
+
+The revision ships an MIT-licensed reference implementation at
+\url{https://github.com/AsakaTigar/anchor-keyframe-control}
+(\texttt{anchor\_release/}, also as a zip in the artifact package)
+containing the probe, BCa bootstrap, classifier, guard, candidates,
+metrics, CogVideoX adapter, executable table scripts, example CSVs with
+the published schema, and unit tests. Commands:
+
+\begin{verbatim}
+python scripts/run_probe.py --backbone synthetic --sources 6 --m 16 --T 12
+python scripts/run_guard.py --csv examples/davis_lane_example.csv
+python scripts/reproduce_table3.py --csv <per-run CSV for Table III>
+python scripts/reproduce_table2.py --csv <per-run CSV for Table II>
+python -m pytest -q tests/
+\end{verbatim}
+
+Third-party weights (CogVideoX, VACE, LTX) are not redistributed; the
+CogVideoX adapter expects a local copy via
+\texttt{COGVIDEOX\_I2V\_DIR} and scales the native condition channels
+per step ($c_s=\gamma_s c(a)$, zero-latent null path); $\gamma{=}1$ is
+the native pipeline. The per-run CSV manifests behind Tables~II--III
+are released in the same schema; the example CSVs are synthetic
+placeholders and are labelled as such.
+
+\section{Known limits of this revision}
+
+Single prompt per panel, six sources in the E2E demo, one seed in the
+E2E, and a photometric anchor swap in the probe are deliberate
+small-scale choices; they validate the software path and do not
+constitute a new effectiveness panel. No human study was run; clip-level
+temporal metrics are implemented in the release but not executed on the
+ANCHOR panels, and no motion-quality claim is made.
+
+\bibliography{references}
+
+\end{document}
